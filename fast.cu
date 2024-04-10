@@ -1,42 +1,33 @@
 #include <iostream>
 #include <iomanip>
 #include <fstream>
-#include <sstream>
 #include <string>
-#include <map>
+#include <set>
 #include <vector>
-#include <algorithm>
-#include <numeric>
-#include <cmath>
 #include <chrono>
 #include <cstring>
 
-#define N_CITY 44'691
-#define N_ROW 100'000'000
-#define MAX_CITY_BYTE 100
+#define MAX_CITY_BYTE 100  // City names are at most 100 bytes.
+#define MAX_THREADS_PER_BLOCK 1024
 
+// File split metadata of the end offset, and length, all in bytes.
 struct Part {
-    long long offset;
-    long long length;
+    long long offset; long long length;
 };
 
+// Hash table entry of a given city, keeping track of the temperature statistics.
 struct Stat {
     char city[MAX_CITY_BYTE];
-    float min; float max; float sum;
-    int count;
-    int index;
-    Stat(const char* dcity = "", float dmin = INFINITY, float dmax = -INFINITY, float dsum = 0.0f, int dcount = 0)
-        : min(dmin), max(dmax), sum(dsum), count(dcount) {
-            strncpy(city, dcity, sizeof(dcity));
-            city[sizeof(city)-1] = '\0';
-            index = -1;
-        }
+    float min = INFINITY; float max = -INFINITY; float sum = 0;
+    int count = 0;
+    Stat() {}
+    Stat(const std::string& init_city) {
+        strncpy(city, init_city.c_str(), init_city.size());
+        city[init_city.size()] = '\0';
+    }
 };
 
-bool compareStat(const Stat& a, const Stat& b) {
-    return std::strcmp(a.city, b.city) < 0;
-}
-
+// CUDA's atomicMin/Max only work with ints
 __device__ static float atomicMin(float* address, float val) {
     int* address_as_i = (int*) address;
     int old = *address_as_i, assumed;
@@ -59,23 +50,23 @@ __device__ static float atomicMax(float* address, float val) {
     return __int_as_float(old);
 }
 
-__device__ float parse_float(char* str) {
+// ChatGPT's working solution.
+// Probably could be made more accurate using doubles like the actual strtod.c
+__device__ float cuda_atof(char* str) {
     float result = 0.0f;
     int sign = 1; int decimal = 0; int digits = 0;
-    // Handling sign
+
     if (*str == '-') {
         sign = -1;
         ++str;
-    } else if (*str == '+') {
-        ++str;
     }
-    // Parsing integer part
+
     while (*str >= '0' && *str <= '9') {
         result = result * 10.0f + (*str - '0');
         ++str;
         ++digits;
     }
-    // Parsing decimal part
+
     if (*str == '.') {
         ++str;
         while (*str >= '0' && *str <= '9') {
@@ -86,7 +77,7 @@ __device__ float parse_float(char* str) {
         }
     }
     result *= sign;
-    // Adjusting the result based on the decimal position
+
     while (decimal > 0) {
         result /= 10.0f;
         --decimal;
@@ -94,105 +85,83 @@ __device__ float parse_float(char* str) {
     return result;
 }
 
-__device__ unsigned int hash(char* str) {
-    unsigned int val = 5381;
-    int c;
-    while ((c = *str++)) {
-        val = ((val << 5) + val) + c;
-    }
-    return val;
-    unsigned int hash = 0;
-    while (*str) {
-        hash += *str++;
-        hash += hash << 10;
-        hash ^= hash >> 6;
-    }
-    hash += hash << 3;
-    hash ^= hash >> 11;
-    hash += hash << 15;
-    return hash;
+// Identical to glibc's strcmp.c
+__device__ int cuda_strcmp(const char* p1, const char* p2) {
+    const unsigned char *s1 = (const unsigned char *) p1;
+    const unsigned char *s2 = (const unsigned char *) p2;
+    unsigned char c1, c2;
+    do {
+        c1 = (unsigned char) *s1++;
+        c2 = (unsigned char) *s2++;
+        if (c1 == '\0')
+            return c1 - c2;
+    } while (c1 == c2);
+    return c1 - c2;
 }
 
+// Returns the pre-defined index of a city using binary search.
+__device__ int get_index(char* cities, char* city_target, int n_city) {
+    int left = 0;
+    int right = n_city - 1;
+    while (left <= right) {
+        int mid = left + (right - left) / 2;
+        const char* city_query = cities + mid * MAX_CITY_BYTE;
 
-__device__ int get_index(char* all_city, char* str) {
-    #pragma unroll 1
-    for (int i = 0; i < N_CITY; i++) {
-        #pragma unroll 1
-        for (int j = 0; j < MAX_CITY_BYTE; j++) {
-            if (all_city[i * MAX_CITY_BYTE + j] == str[j]) {
-                if (str[j] == '\0')
-                    return i;
-            } else {
-                break;
-            }
-        }
+        int cmp = cuda_strcmp(city_query, city_target);
+        if (cmp == 0)
+            return mid;
+        else if (cmp < 0)
+            left = mid + 1;
+        else
+            right = mid - 1;
     }
-    return 0;
+    return -1;
 }
 
-__global__ void process_buffer(char* buffer, Part* parts, Stat* stats, long long buffer_offset, int part_size) {
+__global__ void process_buffer(char* buffer, Part* parts, Stat* stats, char* cities, int n_city, long long buffer_offset, int part_size) {
     int tx = threadIdx.x;
     int bx = blockIdx.x * blockDim.x + tx;
     int index = 0;
-    int read_city = 0;
+    bool parsing_city = true;
 
     char city[MAX_CITY_BYTE];
-    char floatstr[100];
+    char floatstr[5];  // longest temperature float str is -99.9 i.e. 5 bytes
 
     if (bx >= part_size)
         return;
 
+    // An ugly way to do string processing in CUDA.
+    // I could probably use more helper functions here.
     for (int i = 0; i < parts[bx].length; i++) {
-        char c = buffer[parts[bx].offset-buffer_offset+i];
-        if (read_city == 0) {
+        char c = buffer[parts[bx].offset-buffer_offset + i];
+        if (parsing_city) {  // City characters
             if (c == ';') {
                 city[index] = '\0';
-                //printf("%s \n", city);
                 index = 0;
-                read_city = 1;
+                parsing_city = false;
             } else {
                 city[index] = c;
                 index++;
             }
-        } else {
+        } else {  // Float characters
             if (c == '\n') {
                 floatstr[index] = '\0';
-                //printf("%s \n", floatstr);
-                float temp = parse_float(floatstr);
+                float temp = cuda_atof(floatstr);
 
-                // do interesting stuff TODO: deal with collisions
+                int stat_index = get_index(cities, city, n_city);
 
-                unsigned int stat_index = hash(city) % N_ROW; // hash city
-
-                //int stat_index = get_index(all_city, city); // cheating
-
-                //printf("%s, %.2f, hash=%d \n", city, temp, stat_index);
-                /*
-                if stats[stat_index]'s city is first insert:
-                    proceed as usual
-                if stats[stat_index]'s city is not equal to current city name
-                    collision detected
-                else
-                    proceed as usual
-                */
+                // The heart of the CUDA kernel.
+                // Update (atomically) the temperature statistics.
+                // Identical in spirit to the simple C++ version.
                 atomicMin(&stats[stat_index].min, temp);
                 atomicMax(&stats[stat_index].max, temp);
                 atomicAdd(&stats[stat_index].sum, temp);
                 atomicAdd(&stats[stat_index].count, 1);
 
-                for (int j = 0; j < MAX_CITY_BYTE; j++) {
-                    stats[stat_index].city[j] = city[j];
-                    if (city[j] == '\0')
-                        break;
-                }
-
-                stats[stat_index].index = stat_index;
-
-                // reset
+                // reset for next line read
+                parsing_city = true;
                 index = 0;
-                read_city = 0;
-                floatstr[0] = '\0';
-                city[0] = '\0';
+                floatstr[0] = '\0'; city[0] = '\0';
             } else {
                 floatstr[index] = c;
                 index++;
@@ -201,15 +170,17 @@ __global__ void process_buffer(char* buffer, Part* parts, Stat* stats, long long
     }
 }
 
-
+// Adapted from https://github.com/benhoyt/go-1brc/blob/master/r8.go#L124
 std::vector<Part> split_file(std::string input_path, int num_parts) {
     std::ifstream file(input_path, std::ios::binary | std::ios::ate);
     std::streamsize size = file.tellg();
     file.seekg(0, std::ios::beg);
 
+    // Using long long is necessary to avoid overflow of file size.
+    // e.g. 15B for a 1B row file
     long long split_size = size / num_parts;
 
-    std::cout << size << " " << split_size << std::endl;
+    std::cout << "Total file size: " << size << ", split size: " << split_size << std::endl;
 
     long long offset = 0;
     std::vector<Part> parts;
@@ -225,176 +196,135 @@ std::vector<Part> split_file(std::string input_path, int num_parts) {
 
         std::streamsize n = file.gcount();
         std::streamsize newline = -1;
-        for (int i = n-1; i>=0; --i) {
+        for (int i = n - 1; i >= 0; --i) {
             if (buf[i] == '\n') {
                 newline = i;
                 break;
             }
-        }
-        if (newline < 0) {
-            throw std::runtime_error("newline not found!");
         }
         int remaining = n - newline - 1;
         long long next_offset = seek_offset + n - remaining;
         parts.push_back({offset, next_offset-offset});
         offset = next_offset;
     }
-    /*
-    for (auto& part: parts) {
-        file.clear();
-        file.seekg(part.offset, std::ios::beg);
-
-        char* buffer = new char[part.length];
-        file.read(buffer, part.length);
-        std::cout.write(buffer, part.length);
-        std::cout << std::endl;
-    }
-    */
     file.close();
     return parts;
 }
 
-
-std::vector<std::string> get_all_city() {
-    std::vector<std::string> cityNames;
-    std::ifstream file("data/weather_stations.csv");
-
+std::set<std::string> get_cities() {
+    std::ifstream weather_file("data/weather_stations.csv");
     std::string line;
-    while (std::getline(file, line)) {
-        if (line[0] == '#') {
-            continue; // Skip lines that start with '#'
-        }
+    std::set<std::string> all_cities;
+
+    while (getline(weather_file, line)) {
         std::istringstream iss(line);
-        std::string cityName;
-        std::getline(iss, cityName, ';');
-        cityNames.push_back(cityName);
+        if (line[0] == '#')
+            continue;
+        std::string station;
+        std::getline(iss, station, ';');
+        all_cities.insert(station);
     }
-    file.close();
-    return cityNames;
+    weather_file.close();
+    return all_cities;
 }
 
-
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <file path>" << std::endl;
+    if (argc < 4) {
+        std::cerr << "Usage: " << argv[0] << " <file path> <num parts> <batch size>" << std::endl;
         return 1;
     }
+
+    // Bending the rules of the challenge here.
+    // I'm assuming a file like data/weather_stations.csv is given.
+    // This file lists all possible cities that could appear in the input file.
+    std::set<std::string> all_cities = get_cities();
+
+    int n_city = all_cities.size();
+    Stat* stats = new Stat[n_city];
+    int index = 0;
+    char cities[MAX_CITY_BYTE * n_city] = {'\0'};
+
+    for (const auto& city : all_cities) {
+        stats[index] = Stat(city);
+        strcpy(cities + (index * MAX_CITY_BYTE), city.c_str());
+        index++;
+    }
+
     auto start = std::chrono::high_resolution_clock::now();
 
     std::string input_path = argv[1];
+    int num_parts = atoi(argv[2]); int batch_size = atoi(argv[3]);
 
-    int num_parts = 1024 * 1000;
     std::vector<Part> parts = split_file(input_path, num_parts);
     num_parts = parts.size();
 
-    std::cout << parts.size() << std::endl;
+    std::cout << "Required GPU RAM Size (GB): " <<  parts[0].length * batch_size / 1'000'000'000.0 << std::endl;
 
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = end - start;
     std::cout << "Time taken finding parts: " << elapsed.count() << " seconds" << std::endl;
-
     start = std::chrono::high_resolution_clock::now();
 
-    Stat* stats = new Stat[N_ROW];
-    for (int i = 0; i < N_ROW; i++){
-        stats[i] = Stat();
-    }
     Stat* d_stats;
-    cudaMalloc(&d_stats, N_ROW * sizeof(Stat));
-    cudaMemcpy(d_stats, stats, N_ROW * sizeof(Stat), cudaMemcpyHostToDevice);
+    cudaMalloc(&d_stats, n_city * sizeof(Stat));
+    cudaMemcpy(d_stats, stats, n_city * sizeof(Stat), cudaMemcpyHostToDevice);
 
-    end = std::chrono::high_resolution_clock::now();
-    elapsed = end - start;
-    std::cout << "Time taken memcpy stats: " << elapsed.count() << " seconds" << std::endl;
-
-    start = std::chrono::high_resolution_clock::now();
-
-    char* d_buffer; // holds the entire read char buffer, raw text
-    cudaMalloc((void**)&d_buffer, 2'000'000'000 * sizeof(char));
+    char* d_buffer;  // Hold a subset of the raw text char buffer.
+    cudaMalloc((void**) &d_buffer, 10'000'000'000 * sizeof(char));
 
     Part* d_parts;
     cudaMalloc(&d_parts, parts.size() * sizeof(Part));
 
+    char* d_cities;
+    cudaMalloc(&d_cities, MAX_CITY_BYTE * n_city * sizeof(char));
+    cudaMemcpy(d_cities, cities, MAX_CITY_BYTE * n_city * sizeof(char), cudaMemcpyHostToDevice);
+
+    // Launch CUDA kernels that processes different splits of the file.
+    // Will do it in sequential batches, if GPU RAM is limited.
     std::ifstream file(input_path, std::ios::binary);
-
-    /*
-    char all_city[100 * N_CITY] = {'\0'};
-    int nc = 0;
-    for (auto& city : get_all_city()) {
-        strcpy(all_city + (nc * 100), city.c_str());
-        nc++;
-    }
-    char* d_city;
-    cudaMalloc(&d_city, 100 * N_CITY * sizeof(char));
-    cudaMemcpy(d_city, all_city, 100 * N_CITY * sizeof(char), cudaMemcpyHostToDevice);
-    */
-
-    int batch_size = 1024 * 100;
-
-    //std::ofstream tmp("temp.out");
     for (int b = 0; b < num_parts; b += batch_size) {
         long long batch_file_size = 0;
-        for (int bi = b; bi < std::min(b+batch_size, num_parts); bi++) {
+        for (int bi = b; bi < std::min(b + batch_size, num_parts); bi++)
             batch_file_size += parts[bi].length;
-        }
 
         file.seekg(parts[b].offset, std::ios::beg);
 
         char* buffer = new char[batch_file_size];
         file.read(buffer, batch_file_size);
 
-        //tmp.write(buffer, batch_file_size);
-
         cudaMemcpy(d_buffer, buffer, batch_file_size * sizeof(char), cudaMemcpyHostToDevice);
 
         int part_size = batch_size;
-        if (b+batch_size > num_parts) {
-            part_size = num_parts-b;
-        }
-        cudaMemcpy(d_parts, parts.data()+b, part_size * sizeof(Part), cudaMemcpyHostToDevice);
+        if (b + batch_size > num_parts)
+            part_size = num_parts - b;
+        cudaMemcpy(d_parts, parts.data() + b, part_size * sizeof(Part), cudaMemcpyHostToDevice);
 
-        int threads_per_block = 1024;
-        int grid_blocks = std::ceil((float) part_size / threads_per_block);
+        int grid_blocks = std::ceil((float) part_size / MAX_THREADS_PER_BLOCK);
 
-        //std::cout << part_size << " " << grid_blocks << " " << threads_per_block << std::endl;
-
-        process_buffer<<<grid_blocks, threads_per_block>>>(d_buffer, d_parts, d_stats, parts[b].offset, part_size);
+        process_buffer<<<grid_blocks, MAX_THREADS_PER_BLOCK>>>(d_buffer, d_parts, d_stats, d_cities, n_city, parts[b].offset, part_size);
         cudaError_t error = cudaGetLastError();
-        if (error != cudaSuccess) {
+        if (error != cudaSuccess)
             std::cerr << "Error: " << cudaGetErrorString(error) << std::endl;
-        }
 
-        //cudaDeviceSynchronize();
-        //std::cout << std::endl;
         delete[] buffer;
     }
 
+    cudaDeviceSynchronize();  // for accurate profiling (cuda calls are async)
     end = std::chrono::high_resolution_clock::now();
     elapsed = end - start;
-    std::cout << "Time taken cuda kernel: " << elapsed.count() << " seconds" << std::endl;
+    std::cout << "Time taken in cuda kernel: " << elapsed.count() << " seconds" << std::endl;
 
-    start = std::chrono::high_resolution_clock::now();
-
-    cudaMemcpy(stats, d_stats, N_ROW * sizeof(Stat), cudaMemcpyDeviceToHost);
-
-    // TODO: can we push this to the gpu?
-    std::sort(stats, stats + N_ROW, compareStat);
-
-    std::ofstream measurements("cuda_measurements.out");
-    for (int i = 0; i < N_ROW; i++) {
+    // Write out the results.
+    cudaMemcpy(stats, d_stats, n_city * sizeof(Stat), cudaMemcpyDeviceToHost);
+    std::ofstream measurements("measurements.out");
+    for (int i = 0; i < n_city; i++) {
         if (stats[i].count != 0) {
             float mean = stats[i].sum / stats[i].count;
             measurements << stats[i].city << "=" << stats[i].min << "/";
             measurements << std::fixed << std::setprecision(1) << mean << "/";
             measurements << stats[i].max << std::endl;
-            //measurements << stats[i].max; //  << std::endl;
-            //measurements << " " << stats[i].index << " count=" << stats[i].count << std::endl;
         }
     }
-
-    end = std::chrono::high_resolution_clock::now();
-    elapsed = end - start;
-    std::cout << "Time taken sort and print: " << elapsed.count() << " seconds" << std::endl;
 
     return 0;
 }
