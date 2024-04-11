@@ -1,4 +1,4 @@
-# Create the 1 billion row file as measurements.txt
+# Create the 1 billion row file as measurements.txt (~14GB)
 python data/create_measurements.py 1000000000
 
 # Compile and run the c++ baseline.
