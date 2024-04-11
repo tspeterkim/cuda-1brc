@@ -132,7 +132,7 @@ __global__ void process_buffer(char* buffer, Part* parts, Stat* stats, char* cit
         return;
 
     // An ugly way to do string processing in CUDA.
-    // I could probably use more helper functions here.
+    // I could probably use more helper functions here like my own getline.
     for (int i = 0; i < parts[bx].length; i++) {
         char c = buffer[parts[bx].offset-buffer_offset + i];
         if (parsing_city) {  // City characters
