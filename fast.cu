@@ -317,7 +317,7 @@ int main(int argc, char* argv[]) {
 
     // Write out the results, and complete the challenge.
     cudaMemcpy(stats, d_stats, n_city * sizeof(Stat), cudaMemcpyDeviceToHost);
-    std::ofstream measurements("measurements.out");
+    std::ofstream measurements("cuda_measurements.out");
     for (int i = 0; i < n_city; i++) {
         if (stats[i].count != 0) {
             float mean = stats[i].sum / stats[i].count;
