@@ -99,7 +99,7 @@ __device__ int cuda_strcmp(const char* p1, const char* p2) {
     return c1 - c2;
 }
 
-// Returns the pre-defined index of a city using binary search.
+// Returns the pre-defined index of a city using good ol' binary search.
 __device__ int get_index(char* cities, char* city_target, int n_city) {
     int left = 0;
     int right = n_city - 1;
@@ -118,6 +118,7 @@ __device__ int get_index(char* cities, char* city_target, int n_city) {
     return -1;
 }
 
+// The CUDA kernel. Each thread operates on a independent file character buffer, and updates the statistics.
 __global__ void process_buffer(char* buffer, Part* parts, Stat* stats, char* cities, int n_city, long long buffer_offset, int part_size) {
     int tx = threadIdx.x;
     int bx = blockIdx.x * blockDim.x + tx;
@@ -177,7 +178,7 @@ std::vector<Part> split_file(std::string input_path, int num_parts) {
     file.seekg(0, std::ios::beg);
 
     // Using long long is necessary to avoid overflow of file size.
-    // e.g. 15B for a 1B row file
+    // e.g. 15B (bytes) for a 1B-row file
     long long split_size = size / num_parts;
 
     std::cout << "Total file size: " << size << ", split size: " << split_size << std::endl;
@@ -265,22 +266,22 @@ int main(int argc, char* argv[]) {
     std::cout << "Time taken finding parts: " << elapsed.count() << " seconds" << std::endl;
     start = std::chrono::high_resolution_clock::now();
 
-    Stat* d_stats;
+    Stat* d_stats;  // Array of temperature statistics. Each entry corresponds to a different city.
     cudaMalloc(&d_stats, n_city * sizeof(Stat));
     cudaMemcpy(d_stats, stats, n_city * sizeof(Stat), cudaMemcpyHostToDevice);
 
-    char* d_buffer;  // Hold a subset of the raw text char buffer.
+    char* d_buffer;  // Holds a subset of the raw text char buffer.
     cudaMalloc((void**) &d_buffer, 10'000'000'000 * sizeof(char));
 
-    Part* d_parts;
+    Part* d_parts;  // File splits s.t. each thread can work on a different split.
     cudaMalloc(&d_parts, parts.size() * sizeof(Part));
 
-    char* d_cities;
+    char* d_cities;  // List of all cities for city -> index lookup.
     cudaMalloc(&d_cities, MAX_CITY_BYTE * n_city * sizeof(char));
     cudaMemcpy(d_cities, cities, MAX_CITY_BYTE * n_city * sizeof(char), cudaMemcpyHostToDevice);
 
     // Launch CUDA kernels that processes different splits of the file.
-    // Will do it in sequential batches, if GPU RAM is limited.
+    // Does it in sequential batches, if GPU RAM is limited.
     std::ifstream file(input_path, std::ios::binary);
     for (int b = 0; b < num_parts; b += batch_size) {
         long long batch_file_size = 0;
@@ -314,7 +315,7 @@ int main(int argc, char* argv[]) {
     elapsed = end - start;
     std::cout << "Time taken in cuda kernel: " << elapsed.count() << " seconds" << std::endl;
 
-    // Write out the results.
+    // Write out the results, and complete the challenge.
     cudaMemcpy(stats, d_stats, n_city * sizeof(Stat), cudaMemcpyDeviceToHost);
     std::ofstream measurements("measurements.out");
     for (int i = 0; i < n_city; i++) {
