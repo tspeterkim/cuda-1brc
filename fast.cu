@@ -118,7 +118,7 @@ __device__ int get_index(char* cities, char* city_target, int n_city) {
     return -1;
 }
 
-// The CUDA kernel. Each thread operates on a different section of buffer, and updates the statistics.
+// The CUDA kernel. Each thread operates on a different section of the buffer, and updates the statistics.
 __global__ void process_buffer(char* buffer, Part* parts, Stat* stats, char* cities, int n_city, long long buffer_offset, int part_size) {
     int tx = threadIdx.x;
     int bx = blockIdx.x * blockDim.x + tx;
