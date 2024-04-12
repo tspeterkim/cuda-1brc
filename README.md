@@ -1,6 +1,6 @@
 # cuda-1brc
 
-<img src="cover.jpeg" width="500">
+<img src="cover.jpeg" width="300">
 
 The solution takes **16.8 seconds** to process one billion rows. 
 This is a **60X** speedup over a pure C++ baseline in `base.cpp`.
