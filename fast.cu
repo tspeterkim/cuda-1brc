@@ -118,18 +118,19 @@ __device__ int get_index(char* cities, char* city_target, int n_city) {
     return -1;
 }
 
-// The CUDA kernel. Each thread operates on a independent file character buffer, and updates the statistics.
+// The CUDA kernel. Each thread operates on a different section of buffer, and updates the statistics.
 __global__ void process_buffer(char* buffer, Part* parts, Stat* stats, char* cities, int n_city, long long buffer_offset, int part_size) {
     int tx = threadIdx.x;
     int bx = blockIdx.x * blockDim.x + tx;
+
+    if (bx >= part_size)  // For threads that are not assigned any work, return
+        return;
+
     int index = 0;
     bool parsing_city = true;
 
     char city[MAX_CITY_BYTE];
-    char floatstr[5];  // longest temperature float str is -99.9 i.e. 5 bytes
-
-    if (bx >= part_size)
-        return;
+    char floatstr[5];  // longest temperature float str is "-99.9" i.e. 5 bytes
 
     // An ugly way to do string processing in CUDA.
     // I could probably use more helper functions here like my own getline.
@@ -147,13 +148,13 @@ __global__ void process_buffer(char* buffer, Part* parts, Stat* stats, char* cit
         } else {  // Float characters
             if (c == '\n') {
                 floatstr[index] = '\0';
-                float temp = cuda_atof(floatstr);
 
                 int stat_index = get_index(cities, city, n_city);
+                float temp = cuda_atof(floatstr);
 
                 // The heart of the CUDA kernel.
                 // Update (atomically) the temperature statistics.
-                // Identical in spirit to the simple C++ version.
+                // Identical in spirit to the C++ baseline.
                 atomicMin(&stats[stat_index].min, temp);
                 atomicMax(&stats[stat_index].max, temp);
                 atomicAdd(&stats[stat_index].sum, temp);
