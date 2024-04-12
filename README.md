@@ -2,6 +2,8 @@
 
 <img src="cover.jpeg" width="300">
 
+Can CUDA handle one billion rows of text? Yes.
+
 The solution takes **16.8 seconds** to process one billion rows. 
 This is a **60X** speedup over a pure C++ baseline in `base.cpp`.
 
