@@ -15,7 +15,7 @@ struct Part {
     long long offset; long long length;
 };
 
-// Hash table entry of a given city, keeping track of the temperature statistics.
+// Array entry of a given city, keeping track of the temperature statistics.
 struct Stat {
     char city[MAX_CITY_BYTE];
     float min = INFINITY; float max = -INFINITY; float sum = 0;
