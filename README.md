@@ -4,7 +4,7 @@
 
 Can CUDA handle one billion rows of text? Yes.
 
-The solution takes **16.8 seconds** to process one billion rows. 
+The solution takes **16.8 seconds** to process one billion rows on a V100.
 This is a **60X** speedup over a pure C++ baseline in `base.cpp`.
 
 Check out `fast.cu` to see how I do it. 
